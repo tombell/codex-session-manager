@@ -2,7 +2,9 @@ package tui
 
 import (
 	"fmt"
+	"io"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/tombell/codex-session-manager/internal/sessionfmt"
 	"github.com/tombell/codex-session-manager/internal/sessions"
 )
@@ -29,22 +32,19 @@ func (i sessionItem) Title() string {
 }
 
 func (i sessionItem) Description() string {
-	cwd := i.session.CWD
-	if cwd == "" {
-		cwd = filepath.Dir(i.session.Relative)
-	}
-	detail := sessionfmt.ShortPath(cwd)
 	if i.session.Title != "" && i.session.FirstPrompt != "" {
-		detail += " - " + i.session.FirstPrompt
+		return i.malformedPrefix() + i.session.FirstPrompt
 	} else if i.session.FirstPrompt != "" {
-		detail += " - " + i.session.FirstPrompt
-	} else {
-		detail += " - " + filepath.Base(i.session.Path)
+		return i.malformedPrefix() + i.session.FirstPrompt
 	}
+	return i.malformedPrefix() + filepath.Base(i.session.Path)
+}
+
+func (i sessionItem) malformedPrefix() string {
 	if i.session.Malformed {
-		detail = "malformed jsonl; " + detail
+		return "malformed jsonl; "
 	}
-	return detail
+	return ""
 }
 
 func (i sessionItem) FilterValue() string {
@@ -55,8 +55,47 @@ type itemDelegate struct {
 	list.DefaultDelegate
 }
 
+func (d itemDelegate) Height() int               { return 3 }
+func (d itemDelegate) Spacing() int              { return 1 }
 func (d itemDelegate) ShortHelp() []key.Binding  { return nil }
 func (d itemDelegate) FullHelp() [][]key.Binding { return nil }
+
+func (d itemDelegate) Render(w io.Writer, m list.Model, index int, item list.Item) {
+	session, ok := item.(sessionItem)
+	if !ok {
+		return
+	}
+
+	width := m.Width()
+	if width <= 0 {
+		return
+	}
+
+	styles := d.Styles
+	padding := styles.NormalTitle.GetPaddingLeft() + styles.NormalTitle.GetPaddingRight()
+	textWidth := max(width-padding, 0)
+
+	cwd := ansi.Truncate("cwd: "+sessionfmt.ShortPath(displayCWD(session.session)), textWidth, "...")
+	title := ansi.Truncate(session.Title(), textWidth, "...")
+	desc := ansi.Truncate(session.Description(), textWidth, "...")
+
+	isSelected := index == m.Index() && m.FilterState() != list.Filtering
+	if isSelected {
+		cwd = styles.SelectedDesc.Render(cwd)
+		title = styles.SelectedTitle.Render(title)
+		desc = styles.SelectedDesc.Render(desc)
+	} else if m.FilterState() == list.Filtering && m.FilterValue() == "" {
+		cwd = styles.DimmedDesc.Render(cwd)
+		title = styles.DimmedTitle.Render(title)
+		desc = styles.DimmedDesc.Render(desc)
+	} else {
+		cwd = styles.NormalDesc.Render(cwd)
+		title = styles.NormalTitle.Render(title)
+		desc = styles.NormalDesc.Render(desc)
+	}
+
+	fmt.Fprintf(w, "%s\n%s\n%s", cwd, title, desc) //nolint:errcheck
+}
 
 type mode int
 
@@ -76,7 +115,9 @@ type model struct {
 }
 
 type errMsg struct{ err error }
-type loadedMsg struct{ items []list.Item }
+type loadedMsg struct {
+	items []list.Item
+}
 type backedUpMsg struct{ target string }
 type deletedMsg struct{ count int }
 
@@ -254,12 +295,36 @@ func (m model) loadCmd() tea.Cmd {
 		if err != nil {
 			return errMsg{err: err}
 		}
-		items := make([]list.Item, 0, len(found))
-		for _, session := range found {
-			items = append(items, sessionItem{session: session, selected: selected[session.Path]})
-		}
-		return loadedMsg{items: items}
+		return loadedMsg{items: sessionItems(found, selected)}
 	}
+}
+
+func sessionItems(found []sessions.Session, selected map[string]bool) []list.Item {
+	sorted := append([]sessions.Session(nil), found...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		left, right := sorted[i], sorted[j]
+		leftCWD, rightCWD := displayCWD(left), displayCWD(right)
+		if leftCWD != rightCWD {
+			return leftCWD < rightCWD
+		}
+		if !left.Timestamp.Equal(right.Timestamp) {
+			return left.Timestamp.After(right.Timestamp)
+		}
+		return left.Path > right.Path
+	})
+
+	items := make([]list.Item, 0, len(sorted))
+	for _, session := range sorted {
+		items = append(items, sessionItem{session: session, selected: selected[session.Path]})
+	}
+	return items
+}
+
+func displayCWD(session sessions.Session) string {
+	if session.CWD != "" {
+		return session.CWD
+	}
+	return filepath.Dir(session.Relative)
 }
 
 func (m model) backupCmd(selected []sessions.Session) tea.Cmd {
