@@ -33,6 +33,22 @@ func TestScanParsesMetadataAndFirstPrompt(t *testing.T) {
 	}
 }
 
+func TestScanSkipsCodexScaffoldingWhenFindingFirstPrompt(t *testing.T) {
+	root := t.TempDir()
+	writeSession(t, root, "2026/05/24/session.jsonl", `{"type":"session_meta","payload":{"id":"abc"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /tmp/project"},{"type":"input_text","text":"<environment_context>...</environment_context>"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"real user request"}]}}
+`)
+
+	sessions, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sessions[0].FirstPrompt != "real user request" {
+		t.Fatalf("first prompt = %q", sessions[0].FirstPrompt)
+	}
+}
+
 func TestScanMalformedFallsBackToFileInfo(t *testing.T) {
 	root := t.TempDir()
 	writeSession(t, root, "2026/05/24/bad.jsonl", `not json
@@ -54,7 +70,33 @@ func TestScanMalformedFallsBackToFileInfo(t *testing.T) {
 	}
 }
 
-func TestScanWithTitlesEnrichesFromStateDB(t *testing.T) {
+func TestScanWithMetadataEnrichesFromStateDB(t *testing.T) {
+	root := t.TempDir()
+	path := writeSession(t, root, "2026/05/24/session.jsonl", `{"type":"session_meta","payload":{"id":"abc"}}
+`)
+	stateDB := filepath.Join(t.TempDir(), "state.sqlite")
+	db, err := sql.Open("sqlite", stateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("create table threads (rollout_path text not null, title text not null, first_user_message text not null, cwd text not null)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("insert into threads (rollout_path, title, first_user_message, cwd) values (?, ?, ?, ?)", path, "Session Title", "first from db", "/tmp/from-db"); err != nil {
+		t.Fatal(err)
+	}
+
+	sessions, err := ScanWithTitles(root, stateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sessions[0].Title != "Session Title" || sessions[0].FirstPrompt != "first from db" || sessions[0].CWD != "/tmp/from-db" {
+		t.Fatalf("bad metadata: %#v", sessions[0])
+	}
+}
+
+func TestScanWithTitlesEnrichesFromOldStateDBSchema(t *testing.T) {
 	root := t.TempDir()
 	path := writeSession(t, root, "2026/05/24/session.jsonl", `{"type":"session_meta","payload":{"id":"abc"}}
 `)

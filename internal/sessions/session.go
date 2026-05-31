@@ -58,6 +58,10 @@ func DefaultStateDBPath() string {
 	if err != nil {
 		return ""
 	}
+	newPath := filepath.Join(home, ".codex", "sqlite", "state_5.sqlite")
+	if _, err := os.Stat(newPath); err == nil {
+		return newPath
+	}
 	return filepath.Join(home, ".codex", "state_5.sqlite")
 }
 
@@ -107,21 +111,46 @@ func ScanWithTitles(root, stateDB string) ([]Session, error) {
 	if stateDB == "" {
 		return found, nil
 	}
-	titles, err := LoadTitles(stateDB)
+	metadata, err := LoadMetadata(stateDB)
 	if err != nil {
 		return found, nil
 	}
 	for idx := range found {
-		title := titles[found[idx].Path]
-		if title == "" {
-			continue
+		meta := metadata[found[idx].Path]
+		if meta.Title != "" {
+			found[idx].Title = meta.Title
 		}
-		found[idx].Title = title
+		if meta.FirstPrompt != "" {
+			found[idx].FirstPrompt = meta.FirstPrompt
+		}
+		if meta.CWD != "" {
+			found[idx].CWD = meta.CWD
+		}
 	}
 	return found, nil
 }
 
+type Metadata struct {
+	Title       string
+	FirstPrompt string
+	CWD         string
+}
+
 func LoadTitles(stateDB string) (map[string]string, error) {
+	metadata, err := LoadMetadata(stateDB)
+	if err != nil {
+		return nil, err
+	}
+	titles := map[string]string{}
+	for path, meta := range metadata {
+		if meta.Title != "" {
+			titles[path] = meta.Title
+		}
+	}
+	return titles, nil
+}
+
+func LoadMetadata(stateDB string) (map[string]Metadata, error) {
 	if _, err := os.Stat(stateDB); err != nil {
 		return nil, err
 	}
@@ -132,21 +161,39 @@ func LoadTitles(stateDB string) (map[string]string, error) {
 	}
 	defer db.Close()
 
-	rows, err := db.Query("select rollout_path, title from threads where title != '' and rollout_path != ''")
+	rows, err := db.Query("select rollout_path, title, first_user_message, cwd from threads where rollout_path != ''")
+	if err == nil {
+		defer rows.Close()
+		return scanMetadataRows(rows)
+	}
+
+	rows, err = db.Query("select rollout_path, title from threads where title != '' and rollout_path != ''")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	titles := map[string]string{}
+	metadata := map[string]Metadata{}
 	for rows.Next() {
 		var rolloutPath, title string
 		if err := rows.Scan(&rolloutPath, &title); err != nil {
 			return nil, err
 		}
-		titles[rolloutPath] = title
+		metadata[rolloutPath] = Metadata{Title: titleText(title)}
 	}
-	return titles, rows.Err()
+	return metadata, rows.Err()
+}
+
+func scanMetadataRows(rows *sql.Rows) (map[string]Metadata, error) {
+	metadata := map[string]Metadata{}
+	for rows.Next() {
+		var rolloutPath, title, firstUserMessage, cwd string
+		if err := rows.Scan(&rolloutPath, &title, &firstUserMessage, &cwd); err != nil {
+			return nil, err
+		}
+		metadata[rolloutPath] = Metadata{Title: titleText(title), FirstPrompt: promptText(firstUserMessage), CWD: cwd}
+	}
+	return metadata, rows.Err()
 }
 
 func ParseFile(root, path string) (Session, error) {
@@ -272,7 +319,7 @@ func firstPrompt(recordType string, payload map[string]any) string {
 	if recordType == "event_msg" {
 		if msgType, _ := payload["type"].(string); msgType == "user_message" {
 			if message, ok := payload["message"].(string); ok {
-				return compact(message)
+				return promptText(message)
 			}
 		}
 	}
@@ -295,7 +342,9 @@ func firstPrompt(recordType string, payload map[string]any) string {
 			continue
 		}
 		if text, ok := obj["text"].(string); ok {
-			return compact(text)
+			if prompt := promptText(text); prompt != "" {
+				return prompt
+			}
 		}
 	}
 	return ""
@@ -367,6 +416,32 @@ func pruneEmptyDirs(root string) error {
 		}
 	}
 	return nil
+}
+
+func titleText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" || isScaffolding(text) {
+		return ""
+	}
+	return compact(text)
+}
+
+func promptText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" || isScaffolding(text) {
+		return ""
+	}
+	if idx := strings.Index(text, "] user: "); strings.HasPrefix(text, "[") && idx > 0 {
+		text = text[idx+len("] user: "):]
+	}
+	return compact(text)
+}
+
+func isScaffolding(text string) bool {
+	return strings.HasPrefix(text, "<") ||
+		strings.HasPrefix(text, "# AGENTS.md") ||
+		strings.HasPrefix(text, ">>> TRANSCRIPT") ||
+		strings.HasPrefix(text, "The following is the Codex agent history")
 }
 
 func compact(text string) string {

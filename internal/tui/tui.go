@@ -132,7 +132,7 @@ func initialModel(opts sessions.Options) model {
 	delegate.SetSpacing(1)
 	l := list.New([]list.Item{}, delegate, 0, 0)
 	l.Title = "Codex Sessions"
-	l.SetShowStatusBar(true)
+	l.SetShowStatusBar(false)
 	l.SetFilteringEnabled(true)
 	l.SetShowHelp(true)
 	l.AdditionalShortHelpKeys = func() []key.Binding {
