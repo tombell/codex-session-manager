@@ -49,6 +49,43 @@ func TestScanSkipsCodexScaffoldingWhenFindingFirstPrompt(t *testing.T) {
 	}
 }
 
+func TestScanDetectsSubagentSessions(t *testing.T) {
+	root := t.TempDir()
+	writeSession(t, root, "2026/06/18/parent.jsonl", `{"type":"session_meta","payload":{"id":"parent","timestamp":"2026-06-18T10:00:00Z","source":"vscode","thread_source":"user"}}
+`)
+	writeSession(t, root, "2026/06/18/guardian.jsonl", `{"type":"session_meta","payload":{"id":"guardian","parent_thread_id":"parent","timestamp":"2026-06-18T10:00:01Z","source":{"subagent":{"other":"guardian"}},"thread_source":"subagent"}}
+`)
+
+	found, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 2 {
+		t.Fatalf("got %d sessions", len(found))
+	}
+
+	filtered := FilterSubagents(found)
+	if len(filtered) != 1 {
+		t.Fatalf("FilterSubagents kept %d sessions", len(filtered))
+	}
+	if filtered[0].ID != "parent" {
+		t.Fatalf("kept wrong session: %q", filtered[0].ID)
+	}
+
+	for _, s := range found {
+		switch s.ID {
+		case "parent":
+			if s.Subagent {
+				t.Fatal("parent marked as subagent")
+			}
+		case "guardian":
+			if !s.Subagent || s.ParentID != "parent" {
+				t.Fatalf("guardian not detected: %#v", s)
+			}
+		}
+	}
+}
+
 func TestScanMalformedFallsBackToFileInfo(t *testing.T) {
 	root := t.TempDir()
 	writeSession(t, root, "2026/05/24/bad.jsonl", `not json

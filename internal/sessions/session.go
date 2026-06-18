@@ -28,13 +28,16 @@ type Session struct {
 	Size        int64
 	FirstPrompt string
 	Malformed   bool
+	Subagent    bool
+	ParentID    string
 }
 
 type Options struct {
-	SessionsDir string
-	BackupDir   string
-	StateDB     string
-	DryRun      bool
+	SessionsDir      string
+	BackupDir        string
+	StateDB          string
+	DryRun           bool
+	IncludeSubagents bool
 }
 
 func DefaultSessionsDir() string {
@@ -101,6 +104,20 @@ func Scan(root string) ([]Session, error) {
 		return left.Path > right.Path
 	})
 	return found, nil
+}
+
+// FilterSubagents returns only top-level (non-subagent) sessions. Codex spawns
+// subagent threads (for example the "guardian" approval reviewer) that each get
+// their own rollout file; these would otherwise appear as duplicate sessions.
+func FilterSubagents(in []Session) []Session {
+	out := in[:0:0]
+	for _, session := range in {
+		if session.Subagent {
+			continue
+		}
+		out = append(out, session)
+	}
+	return out
 }
 
 func ScanWithTitles(root, stateDB string) ([]Session, error) {
@@ -307,6 +324,18 @@ func readMeta(payload map[string]any, session *Session) {
 	}
 	if cwd, ok := payload["cwd"].(string); ok {
 		session.CWD = cwd
+	}
+	if parent, ok := payload["parent_thread_id"].(string); ok && parent != "" {
+		session.ParentID = parent
+		session.Subagent = true
+	}
+	if threadSource, ok := payload["thread_source"].(string); ok && threadSource == "subagent" {
+		session.Subagent = true
+	}
+	if source, ok := payload["source"].(map[string]any); ok {
+		if _, ok := source["subagent"]; ok {
+			session.Subagent = true
+		}
 	}
 	if raw, ok := payload["timestamp"].(string); ok {
 		if ts, err := time.Parse(time.RFC3339Nano, raw); err == nil {

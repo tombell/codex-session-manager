@@ -289,11 +289,15 @@ func (m model) selectedSessions() []sessions.Session {
 func (m model) loadCmd() tea.Cmd {
 	root := m.root
 	stateDB := m.opts.StateDB
+	includeSubagents := m.opts.IncludeSubagents
 	selected := m.selected
 	return func() tea.Msg {
 		found, err := sessions.ScanWithTitles(root, stateDB)
 		if err != nil {
 			return errMsg{err: err}
+		}
+		if !includeSubagents {
+			found = sessions.FilterSubagents(found)
 		}
 		return loadedMsg{items: sessionItems(found, selected)}
 	}

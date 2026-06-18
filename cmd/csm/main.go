@@ -18,6 +18,7 @@ func main() {
 	flag.StringVar(&opts.BackupDir, "backup-dir", sessions.DefaultBackupBaseDir(), "backup base directory")
 	flag.StringVar(&opts.StateDB, "state-db", sessions.DefaultStateDBPath(), "Codex state SQLite database for session titles")
 	flag.BoolVar(&opts.DryRun, "dry-run", false, "show actions without copying or deleting files")
+	flag.BoolVar(&opts.IncludeSubagents, "include-subagents", false, "include subagent sessions (e.g. guardian) that are normally hidden")
 	flag.BoolVar(&listOnly, "list", false, "list sessions and exit")
 	flag.Parse()
 
@@ -33,7 +34,7 @@ func main() {
 	opts.SessionsDir = root
 
 	if listOnly {
-		if err := printSessions(opts.SessionsDir, opts.StateDB); err != nil {
+		if err := printSessions(opts.SessionsDir, opts.StateDB, opts.IncludeSubagents); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -46,10 +47,13 @@ func main() {
 	}
 }
 
-func printSessions(root, stateDB string) error {
+func printSessions(root, stateDB string, includeSubagents bool) error {
 	found, err := sessions.ScanWithTitles(root, stateDB)
 	if err != nil {
 		return err
+	}
+	if !includeSubagents {
+		found = sessions.FilterSubagents(found)
 	}
 	for _, session := range found {
 		fmt.Printf("%s\t%s\t%s\t%s\n",
