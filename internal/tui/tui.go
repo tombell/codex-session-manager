@@ -131,7 +131,7 @@ func initialModel(opts sessions.Options) model {
 	delegate := itemDelegate{DefaultDelegate: list.NewDefaultDelegate()}
 	delegate.SetSpacing(1)
 	l := list.New([]list.Item{}, delegate, 0, 0)
-	l.Title = "Codex Sessions"
+	l.Title = "Codex Chats"
 	l.SetShowStatusBar(false)
 	l.SetFilteringEnabled(true)
 	l.SetShowHelp(true)
@@ -148,7 +148,7 @@ func initialModel(opts sessions.Options) model {
 		opts:     opts,
 		root:     opts.SessionsDir,
 		selected: map[string]bool{},
-		status:   "loading sessions...",
+		status:   "loading chats...",
 	}
 }
 
@@ -163,7 +163,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case loadedMsg:
 		m.list.SetItems(msg.items)
-		m.status = fmt.Sprintf("loaded %d sessions", len(msg.items))
+		m.status = fmt.Sprintf("loaded %d chats", len(msg.items))
 		m.statusErr = false
 		return m, nil
 	case backedUpMsg:
@@ -176,9 +176,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case deletedMsg:
 		if m.opts.DryRun {
-			m.status = fmt.Sprintf("dry run: would delete %d sessions", msg.count)
+			m.status = fmt.Sprintf("dry run: would delete %d chats", msg.count)
 		} else {
-			m.status = fmt.Sprintf("deleted %d sessions", msg.count)
+			m.status = fmt.Sprintf("deleted %d chats", msg.count)
 			m.selected = map[string]bool{}
 		}
 		m.statusErr = false
@@ -226,11 +226,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.mode = modeConfirmDelete
-			m.status = fmt.Sprintf("delete %d selected sessions? y/N", len(m.selectedSessions()))
+			m.status = fmt.Sprintf("hard-delete %d selected chats and their subagents? y/N", len(m.selectedSessions()))
 			m.statusErr = true
 			return m, nil
 		case "r":
-			m.status = "reloading sessions..."
+			m.status = "reloading chats..."
 			m.statusErr = false
 			return m, m.loadCmd()
 		}
@@ -343,9 +343,9 @@ func (m model) backupCmd(selected []sessions.Session) tea.Cmd {
 }
 
 func (m model) deleteCmd(selected []sessions.Session) tea.Cmd {
-	root, dryRun := m.root, m.opts.DryRun
+	root, stateDB, dryRun := m.root, m.opts.StateDB, m.opts.DryRun
 	return func() tea.Msg {
-		if err := sessions.Delete(root, selected, dryRun); err != nil {
+		if err := sessions.Delete(root, stateDB, selected, dryRun); err != nil {
 			return errMsg{err: err}
 		}
 		return deletedMsg{count: len(selected)}

@@ -2,6 +2,8 @@ package sessions
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -9,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -178,13 +181,23 @@ func LoadMetadata(stateDB string) (map[string]Metadata, error) {
 	}
 	defer db.Close()
 
-	rows, err := db.Query("select rollout_path, title, first_user_message, cwd from threads where rollout_path != ''")
-	if err == nil {
-		defer rows.Close()
-		return scanMetadataRows(rows)
+	// Codex 0.145 added a user-facing thread name. Prefer it over the
+	// generated title while retaining compatibility with older databases.
+	queries := []string{
+		"select rollout_path, coalesce(nullif(trim(name), ''), title), first_user_message, cwd from threads where rollout_path != ''",
+		"select rollout_path, title, first_user_message, cwd from threads where rollout_path != ''",
+	}
+	for _, query := range queries {
+		rows, queryErr := db.Query(query)
+		if queryErr != nil {
+			continue
+		}
+		metadata, scanErr := scanMetadataRows(rows)
+		rows.Close()
+		return metadata, scanErr
 	}
 
-	rows, err = db.Query("select rollout_path, title from threads where title != '' and rollout_path != ''")
+	rows, err := db.Query("select rollout_path, title from threads where title != '' and rollout_path != ''")
 	if err != nil {
 		return nil, err
 	}
@@ -273,7 +286,9 @@ func Backup(root, backupBase string, selected []Session, now time.Time, dryRun b
 	return target, nil
 }
 
-func Delete(root string, selected []Session, dryRun bool) error {
+var codexExecutable = "codex"
+
+func Delete(root, stateDB string, selected []Session, dryRun bool) error {
 	for _, session := range selected {
 		if err := validateSessionPath(root, session.Path); err != nil {
 			return err
@@ -281,16 +296,202 @@ func Delete(root string, selected []Session, dryRun bool) error {
 		if filepath.Ext(session.Path) != ".jsonl" {
 			return fmt.Errorf("refusing to delete non-jsonl path: %s", session.Path)
 		}
-		if !dryRun {
-			if err := os.Remove(session.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return err
-			}
-		}
 	}
 	if dryRun {
 		return nil
 	}
+
+	withID := make([]Session, 0, len(selected))
+	withoutID := make([]Session, 0, len(selected))
+	for _, session := range selected {
+		if session.ID == "" && stateDB != "" {
+			id, err := loadThreadID(stateDB, session.Path)
+			if err != nil {
+				return err
+			}
+			session.ID = id
+		}
+		if session.ID == "" {
+			withoutID = append(withoutID, session)
+		} else {
+			withID = append(withID, session)
+		}
+	}
+
+	if len(withID) > 0 {
+		codexHome, err := codexHomeForSessions(root)
+		if err != nil {
+			return err
+		}
+		if err := deleteCodexThreads(codexHome, withID); err != nil {
+			return err
+		}
+	}
+
+	// A file without a thread id has no chat that the app-server can address.
+	// Preserve the old cleanup behavior for such malformed rollout files.
+	for _, session := range withoutID {
+		if err := os.Remove(session.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	return pruneEmptyDirs(root)
+}
+
+func loadThreadID(stateDB, rolloutPath string) (string, error) {
+	if _, err := os.Stat(stateDB); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", err
+	}
+	db, err := sql.Open("sqlite", stateDB)
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+
+	var id string
+	err = db.QueryRow("select id from threads where rollout_path = ? limit 1", rolloutPath).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
+}
+
+func codexHomeForSessions(root string) (string, error) {
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	if filepath.Base(root) != "sessions" {
+		return "", fmt.Errorf("cannot delete Codex chat: sessions root must end in %q: %s", "sessions", root)
+	}
+	return filepath.Dir(root), nil
+}
+
+func deleteCodexThreads(codexHome string, selected []Session) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, codexExecutable, "app-server", "--stdio")
+	cmd.Env = envWith(os.Environ(), "CODEX_HOME", codexHome)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start Codex app-server: %w", err)
+	}
+
+	encoder := json.NewEncoder(stdin)
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	finish := func() error {
+		_ = stdin.Close()
+		return cmd.Wait()
+	}
+	fail := func(err error) error {
+		_ = finish()
+		if ctx.Err() != nil {
+			return fmt.Errorf("Codex app-server timed out: %w", ctx.Err())
+		}
+		if detail := strings.TrimSpace(stderr.String()); detail != "" {
+			return fmt.Errorf("%w: %s", err, compact(detail))
+		}
+		return err
+	}
+
+	initialize := map[string]any{
+		"method": "initialize",
+		"id":     1,
+		"params": map[string]any{"clientInfo": map[string]string{
+			"name": "codex_session_manager", "title": "Codex Session Manager", "version": "dev",
+		}},
+	}
+	if err := encoder.Encode(initialize); err != nil {
+		return fail(err)
+	}
+	if err := readCodexResponse(scanner, 1); err != nil {
+		return fail(fmt.Errorf("initialize Codex app-server: %w", err))
+	}
+	if err := encoder.Encode(map[string]any{"method": "initialized"}); err != nil {
+		return fail(err)
+	}
+
+	for idx, session := range selected {
+		requestID := idx + 2
+		request := map[string]any{
+			"method": "thread/delete",
+			"id":     requestID,
+			"params": map[string]string{"threadId": session.ID},
+		}
+		if err := encoder.Encode(request); err != nil {
+			return fail(err)
+		}
+		if err := readCodexResponse(scanner, requestID); err != nil {
+			// Deleting a parent also deletes its spawned descendants. A selected
+			// descendant may therefore be gone by the time its request runs.
+			if _, statErr := os.Stat(session.Path); errors.Is(statErr, os.ErrNotExist) {
+				continue
+			}
+			return fail(fmt.Errorf("delete Codex chat %s: %w", session.ID, err))
+		}
+	}
+
+	if err := finish(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("Codex app-server timed out: %w", ctx.Err())
+		}
+		return fmt.Errorf("Codex app-server exited: %w", err)
+	}
+	return nil
+}
+
+func readCodexResponse(scanner *bufio.Scanner, requestID int) error {
+	for scanner.Scan() {
+		var message struct {
+			ID    json.RawMessage `json:"id"`
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &message); err != nil {
+			return fmt.Errorf("invalid Codex app-server response: %w", err)
+		}
+		if len(message.ID) == 0 {
+			continue
+		}
+		var gotID int
+		if err := json.Unmarshal(message.ID, &gotID); err != nil || gotID != requestID {
+			continue
+		}
+		if message.Error != nil {
+			return errors.New(message.Error.Message)
+		}
+		return nil
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return errors.New("Codex app-server closed without a response")
+}
+
+func envWith(env []string, key, value string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, prefix) {
+			out = append(out, entry)
+		}
+	}
+	return append(out, prefix+value)
 }
 
 func parseJSONL(r io.Reader, session *Session) error {
